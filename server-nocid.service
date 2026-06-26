@@ -1,0 +1,13 @@
+[Unit]
+Description=Red1rect BS TURN Server (noCID, obfs, port 57011)
+After=network.target
+
+[Service]
+ExecStart=/opt/server-noCID -listen 0.0.0.0:57011 -connect 127.0.0.1:51820 -obfs
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/server-noCID.log
+StandardError=append:/var/log/server-noCID.log
+
+[Install]
+WantedBy=multi-user.target
