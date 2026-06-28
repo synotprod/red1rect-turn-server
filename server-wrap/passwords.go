@@ -80,7 +80,7 @@ func (ps *PasswordStore) GetOrCreate(password string, mgr *WGManager) (*Password
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	if e, ok := ps.entries[password]; ok {
+	if e, ok := ps.entries[password]; ok && e != nil {
 		return e, nil
 	}
 
