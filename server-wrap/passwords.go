@@ -160,8 +160,13 @@ func (ps *PasswordStore) StartAPI(addr string, mgr *WGManager) {
 		}
 		switch r.Method {
 		case http.MethodPost:
-			ps.AddPassword(body.Password)
-			w.WriteHeader(204)
+			entry, err := ps.GetOrCreate(body.Password, mgr)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(entry)
 		case http.MethodDelete:
 			ps.RemovePassword(body.Password, mgr)
 			w.WriteHeader(204)
