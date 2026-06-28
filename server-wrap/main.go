@@ -131,26 +131,31 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
 
-	var header [6]byte
-	if _, err := readFull(conn, header[:]); err != nil {
+	// DTLS is datagram-based: read full auth packet in one call.
+	authBuf := make([]byte, 512)
+	n, err := conn.Read(authBuf)
+	if err != nil {
 		log.Printf("[conn] read header: %v", err)
 		return
 	}
-	if [4]byte(header[:4]) != magicAuth {
-		log.Printf("[conn] bad magic: %x", header[:4])
+	if n < 6 {
+		log.Printf("[conn] packet too short: %d", n)
 		return
 	}
-	plen := binary.BigEndian.Uint16(header[4:6])
+	if [4]byte(authBuf[:4]) != magicAuth {
+		log.Printf("[conn] bad magic: %x", authBuf[:4])
+		return
+	}
+	plen := binary.BigEndian.Uint16(authBuf[4:6])
 	if plen == 0 || plen > 256 {
 		log.Printf("[conn] bad password length: %d", plen)
 		return
 	}
-	passBuf := make([]byte, plen)
-	if _, err := readFull(conn, passBuf); err != nil {
-		log.Printf("[conn] read password: %v", err)
+	if n < 6+int(plen) {
+		log.Printf("[conn] packet too short for password: %d < %d", n, 6+int(plen))
 		return
 	}
-	password := string(passBuf)
+	password := string(authBuf[6 : 6+int(plen)])
 
 	if !store.Has(password) {
 		log.Printf("[conn] unknown password from %v", remote)
