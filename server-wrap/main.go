@@ -193,24 +193,58 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 
 	log.Printf("[conn] auth OK %v (ip=%s)", remote, entry.ClientIP)
 
+	// Proxy WG traffic between this DTLS conn and the local wg1 interface.
+	localUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		log.Printf("[conn] local udp: %v", err)
+		return
+	}
+	defer localUDP.Close()
+	wg1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wgPort}
+
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
 
+	// DTLS → wg1: receive WG packets from client, forward to local WireGuard.
 	go func() {
 		defer connCancel()
-		buf := make([]byte, 64)
+		buf := make([]byte, 65536)
 		for {
 			conn.SetDeadline(time.Now().Add(70 * time.Second))
 			n, err := conn.Read(buf)
 			if err != nil {
+				log.Printf("[conn] read: %v", err)
 				return
 			}
-			if n >= 4 && [4]byte(buf[:4]) == magicPong {
-				// Received pong — reset deadline handled by next iteration.
+			// Skip PONG keepalive responses — don't forward to WireGuard.
+			if n == 4 && [4]byte(buf[:4]) == magicPong {
+				continue
+			}
+			if _, err := localUDP.WriteToUDP(buf[:n], wg1Addr); err != nil {
+				return
 			}
 		}
 	}()
 
+	// wg1 → DTLS: receive WG responses from local WireGuard, forward to client.
+	go func() {
+		defer connCancel()
+		buf := make([]byte, 65536)
+		for {
+			localUDP.SetReadDeadline(time.Now().Add(70 * time.Second))
+			n, _, err := localUDP.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(buf[:n]); err != nil {
+				return
+			}
+			conn.SetDeadline(time.Time{})
+		}
+	}()
+
+	// PING keepalive: server → client every 20s to detect dead connections.
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -218,7 +252,7 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 		case <-connCtx.Done():
 			return
 		case <-ticker.C:
-			conn.SetDeadline(time.Now().Add(10 * time.Second))
+			conn.SetDeadline(time.Now().Add(5 * time.Second))
 			if _, err := conn.Write(magicPing[:]); err != nil {
 				log.Printf("[conn] ping: %v", err)
 				return
