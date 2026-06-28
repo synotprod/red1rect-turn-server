@@ -1,0 +1,12 @@
+[Unit]
+Description=Red1rect VPN Server (WRAP protocol)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/server-wrap -listen 0.0.0.0:57011 -wg wg1 -wg-public-ip 23.26.37.179 -wg-port 51820 -store /etc/red1rect-passwords.json -api 127.0.0.1:8765 -dns 1.1.1.1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
