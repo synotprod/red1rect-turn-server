@@ -200,8 +200,8 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 		log.Printf("[conn] session: %v", err)
 		return
 	}
-	sess.addConn(conn)
-	defer sess.removeConn(conn)
+	sc := sess.addConn(conn)
+	defer sess.removeConn(sc)
 
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
@@ -216,6 +216,7 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 			if err != nil {
 				return
 			}
+			sc.touch() // любой входящий (WG-данные или PONG) → коннект живой
 			if n == 4 && [4]byte(buf[:4]) == magicPong {
 				continue
 			}
