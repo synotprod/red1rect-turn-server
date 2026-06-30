@@ -193,19 +193,20 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 
 	log.Printf("[conn] auth OK %v (ip=%s)", remote, entry.ClientIP)
 
-	// Proxy WG traffic between this DTLS conn and the local wg1 interface.
-	localUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	// Мультипоток: коннекты одного пароля агрегируются в ОДИН WG-прокси
+	// (общий localUDP↔wg1). Ответы WG раздаются по живым коннектам.
+	sess, err := getOrCreateSession(password, wgPort)
 	if err != nil {
-		log.Printf("[conn] local udp: %v", err)
+		log.Printf("[conn] session: %v", err)
 		return
 	}
-	defer localUDP.Close()
-	wg1Addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wgPort}
+	sess.addConn(conn)
+	defer sess.removeConn(conn)
 
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
 
-	// DTLS → wg1: receive WG packets from client, forward to local WireGuard.
+	// DTLS → wg1: WG-пакеты от клиента в ОБЩИЙ localUDP сессии.
 	go func() {
 		defer connCancel()
 		buf := make([]byte, 65536)
@@ -213,38 +214,19 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 			conn.SetDeadline(time.Now().Add(70 * time.Second))
 			n, err := conn.Read(buf)
 			if err != nil {
-				log.Printf("[conn] read: %v", err)
 				return
 			}
-			// Skip PONG keepalive responses — don't forward to WireGuard.
 			if n == 4 && [4]byte(buf[:4]) == magicPong {
 				continue
 			}
-			if _, err := localUDP.WriteToUDP(buf[:n], wg1Addr); err != nil {
+			if _, err := sess.localUDP.WriteToUDP(buf[:n], sess.wg1Addr); err != nil {
 				return
 			}
 		}
 	}()
+	// wg1 → DTLS направление обслуживает общая горутина сессии (wgToConns).
 
-	// wg1 → DTLS: receive WG responses from local WireGuard, forward to client.
-	go func() {
-		defer connCancel()
-		buf := make([]byte, 65536)
-		for {
-			localUDP.SetReadDeadline(time.Now().Add(70 * time.Second))
-			n, _, err := localUDP.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			conn.SetDeadline(time.Now().Add(5 * time.Second))
-			if _, err := conn.Write(buf[:n]); err != nil {
-				return
-			}
-			conn.SetDeadline(time.Time{})
-		}
-	}()
-
-	// PING keepalive: server → client every 20s to detect dead connections.
+	// PING keepalive: server → client каждые 20с (детект мёртвых коннектов).
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
