@@ -219,8 +219,6 @@ func handleConn(ctx context.Context, conn net.Conn, store *PasswordStore, mgr *W
 			if n == 4 && [4]byte(buf[:4]) == magicPong {
 				continue
 			}
-			// Этот коннект несёт WG-данные → он активный (ответы вернём в него).
-			sess.setActive(conn)
 			if _, err := sess.localUDP.WriteToUDP(buf[:n], sess.wg1Addr); err != nil {
 				return
 			}

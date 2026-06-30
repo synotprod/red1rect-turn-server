@@ -11,6 +11,9 @@ import (
 // Все коннекты делят общий localUDP↔wg1 (wg1 видит один эндпоинт, не «прыгает»).
 // Ответы WG раздаются по живым коннектам round-robin'ом. Это даёт мультипоток:
 // клиент гонит WG по N потокам, любой живой несёт трафик, мёртвый не мешает.
+// chunkSize — пакетов подряд в один коннект перед переключением (как у клиента).
+const chunkSize = 8
+
 type peerSession struct {
 	password   string
 	localUDP   *net.UDPConn
@@ -18,25 +21,6 @@ type peerSession struct {
 	mu         sync.Mutex
 	conns      []net.Conn
 	closeTimer *time.Timer
-
-	// activeConn — коннект, ПОСЛЕДНИМ приславший WG-данные. Клиент шлёт WG через
-	// один активный поток (active/standby, без reordering); ответы WG возвращаем
-	// в него же. На фейловере клиент переключит поток → сменится active.
-	activeMu   sync.Mutex
-	activeConn net.Conn
-}
-
-func (s *peerSession) setActive(c net.Conn) {
-	s.activeMu.Lock()
-	s.activeConn = c
-	s.activeMu.Unlock()
-}
-
-func (s *peerSession) getActive() net.Conn {
-	s.activeMu.Lock()
-	c := s.activeConn
-	s.activeMu.Unlock()
-	return c
 }
 
 var (
@@ -65,26 +49,39 @@ func getOrCreateSession(password string, wgPort int) (*peerSession, error) {
 	return s, nil
 }
 
-// wgToConns читает ответы WG из общего localUDP и шлёт в АКТИВНЫЙ коннект (тот,
-// что последним прислал WG-данные). Это active/standby — без reordering. Если
-// активный мёртв/не задан — фолбэк на любой живой.
+// wgToConns читает ответы WG из общего localUDP и раздаёт по коннектам CHUNK'ами
+// (chunked round-robin, как клиент): chunkSize пакетов подряд в один коннект,
+// потом следующий — внутри TCP-окна один путь (без reorder), нагрузка по всем.
 func (s *peerSession) wgToConns() {
 	buf := make([]byte, 65536)
+	idx, cnt := 0, 0
 	for {
 		n, _, err := s.localUDP.ReadFromUDP(buf)
 		if err != nil {
 			return // localUDP закрыт = сессия завершена
 		}
-		c := s.getActive()
-		if c == nil || !s.hasConn(c) {
-			c = s.pickConn()
-		}
-		if c == nil {
+		s.mu.Lock()
+		conns := append([]net.Conn(nil), s.conns...)
+		s.mu.Unlock()
+		nc := len(conns)
+		if nc == 0 {
 			continue
 		}
+		if cnt >= chunkSize {
+			cnt = 0
+			idx = (idx + 1) % nc
+		}
+		if idx >= nc {
+			idx = 0
+		}
+		c := conns[idx]
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, werr := c.Write(buf[:n]); werr != nil {
-			if c2 := s.pickConn(); c2 != nil && c2 != c {
+			// коннект сбоит — пробуем следующий, новый чанк
+			if nc > 1 {
+				idx = (idx + 1) % nc
+				cnt = 0
+				c2 := conns[idx]
 				c2.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				c2.Write(buf[:n])
 				c2.SetWriteDeadline(time.Time{})
@@ -92,28 +89,8 @@ func (s *peerSession) wgToConns() {
 			continue
 		}
 		c.SetWriteDeadline(time.Time{})
+		cnt++
 	}
-}
-
-func (s *peerSession) hasConn(c net.Conn) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, cc := range s.conns {
-		if cc == c {
-			return true
-		}
-	}
-	return false
-}
-
-// pickConn — любой живой коннект (фолбэк когда активный не задан/мёртв).
-func (s *peerSession) pickConn() net.Conn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.conns) == 0 {
-		return nil
-	}
-	return s.conns[0]
 }
 
 func (s *peerSession) addConn(c net.Conn) {
