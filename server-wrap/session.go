@@ -17,8 +17,26 @@ type peerSession struct {
 	wg1Addr    *net.UDPAddr
 	mu         sync.Mutex
 	conns      []net.Conn
-	rrIdx      int
 	closeTimer *time.Timer
+
+	// activeConn — коннект, ПОСЛЕДНИМ приславший WG-данные. Клиент шлёт WG через
+	// один активный поток (active/standby, без reordering); ответы WG возвращаем
+	// в него же. На фейловере клиент переключит поток → сменится active.
+	activeMu   sync.Mutex
+	activeConn net.Conn
+}
+
+func (s *peerSession) setActive(c net.Conn) {
+	s.activeMu.Lock()
+	s.activeConn = c
+	s.activeMu.Unlock()
+}
+
+func (s *peerSession) getActive() net.Conn {
+	s.activeMu.Lock()
+	c := s.activeConn
+	s.activeMu.Unlock()
+	return c
 }
 
 var (
@@ -47,7 +65,9 @@ func getOrCreateSession(password string, wgPort int) (*peerSession, error) {
 	return s, nil
 }
 
-// wgToConns читает ответы WG из общего localUDP и шлёт в живой коннект (round-robin).
+// wgToConns читает ответы WG из общего localUDP и шлёт в АКТИВНЫЙ коннект (тот,
+// что последним прислал WG-данные). Это active/standby — без reordering. Если
+// активный мёртв/не задан — фолбэк на любой живой.
 func (s *peerSession) wgToConns() {
 	buf := make([]byte, 65536)
 	for {
@@ -55,13 +75,15 @@ func (s *peerSession) wgToConns() {
 		if err != nil {
 			return // localUDP закрыт = сессия завершена
 		}
-		c := s.pickConn()
+		c := s.getActive()
+		if c == nil || !s.hasConn(c) {
+			c = s.pickConn()
+		}
 		if c == nil {
 			continue
 		}
 		c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if _, werr := c.Write(buf[:n]); werr != nil {
-			// коннект сбоит — пробуем другой
 			if c2 := s.pickConn(); c2 != nil && c2 != c {
 				c2.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				c2.Write(buf[:n])
@@ -73,17 +95,25 @@ func (s *peerSession) wgToConns() {
 	}
 }
 
+func (s *peerSession) hasConn(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, cc := range s.conns {
+		if cc == c {
+			return true
+		}
+	}
+	return false
+}
+
+// pickConn — любой живой коннект (фолбэк когда активный не задан/мёртв).
 func (s *peerSession) pickConn() net.Conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.conns) == 0 {
 		return nil
 	}
-	s.rrIdx++
-	if s.rrIdx >= len(s.conns) {
-		s.rrIdx = 0
-	}
-	return s.conns[s.rrIdx]
+	return s.conns[0]
 }
 
 func (s *peerSession) addConn(c net.Conn) {
