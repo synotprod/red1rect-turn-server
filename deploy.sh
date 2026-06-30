@@ -1,99 +1,77 @@
-#!/bin/bash
-# Red1rect Turn Server — deploy script
-# Installs and starts the server on a fresh Ubuntu/Debian VPS.
-# Usage: bash deploy.sh
+#!/usr/bin/env bash
+# Red1rect WRAP VPN server — деплой (1 поток) на свежую Ubuntu/Debian VPS.
+# Запуск от root:  bash deploy.sh [PUBLIC_IP]
+# PUBLIC_IP опционален — по умолчанию автоопределяется.
 set -e
 
-GO_VERSION="1.24.3"
-INSTALL_DIR="/opt/red1rect-server"
+PUBLIC_IP="${1:-$(curl -s -4 --max-time 8 ifconfig.me || hostname -I | awk '{print $1}')}"
+EXT_IF="$(ip route | awk '/^default/{print $5; exit}')"
+LISTEN_PORT=57011      # внешний порт сервера (DTLS-over-TURN)
+WG_IF=wg1
 WG_PORT=51820
-DTLS_PORT=57000
-OBFS_PORT=57010
 
-echo "[1/6] Installing dependencies..."
-apt-get update -qq
-apt-get install -y -qq wireguard wireguard-tools curl git
+echo "==> Public IP: $PUBLIC_IP | внешний интерфейс: $EXT_IF"
+[ -z "$EXT_IF" ] && { echo "Не нашёл внешний интерфейс"; exit 1; }
 
-echo "[2/6] Installing Go $GO_VERSION..."
-if ! go version 2>/dev/null | grep -q "$GO_VERSION"; then
-    curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
-    export PATH="/usr/local/go/bin:$PATH"
-    echo 'export PATH="/usr/local/go/bin:$PATH"' >> /etc/profile
+echo "==> Зависимости"
+apt-get update -y
+apt-get install -y wireguard iptables golang-go curl git ca-certificates
+
+echo "==> ip_forward"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+echo "==> WireGuard $WG_IF (сервер. WRAP-клиенты получают 10.66.66.X динамически)"
+mkdir -p /etc/wireguard
+if [ ! -f /etc/wireguard/${WG_IF}_private.key ]; then
+    umask 077
+    wg genkey | tee /etc/wireguard/${WG_IF}_private.key | wg pubkey > /etc/wireguard/${WG_IF}_public.key
 fi
-go version
+PRIV="$(cat /etc/wireguard/${WG_IF}_private.key)"
 
-echo "[3/6] Building server..."
-mkdir -p "$INSTALL_DIR"
-cp -r . "$INSTALL_DIR/src"
-cd "$INSTALL_DIR/src"
-go build -o "$INSTALL_DIR/server" ./server/
-echo "✓ Build OK: $INSTALL_DIR/server"
-
-echo "[4/6] Setting up WireGuard..."
-if [ ! -f /etc/wireguard/wg0.conf ]; then
-    wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
-    SERVER_PRIVATE=$(cat /etc/wireguard/server_private.key)
-    SERVER_PUBLIC=$(cat /etc/wireguard/server_public.key)
-    cat > /etc/wireguard/wg0.conf <<EOF
+cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
-PrivateKey = $SERVER_PRIVATE
+PrivateKey = $PRIV
 Address = 10.66.68.1/24
 ListenPort = $WG_PORT
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o \$(ip route | grep default | awk '{print \$5}') -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o \$(ip route | grep default | awk '{print \$5}') -j MASQUERADE
+MTU = 1280
+PostUp = ip route add 10.66.66.0/24 dev $WG_IF; iptables -t nat -A POSTROUTING -s 10.66.68.0/24 -o $EXT_IF -j MASQUERADE; iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -o $EXT_IF -j MASQUERADE; iptables -I FORWARD -i $WG_IF -j ACCEPT; iptables -I FORWARD -o $WG_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostDown = ip route del 10.66.66.0/24 dev $WG_IF 2>/dev/null; iptables -t nat -D POSTROUTING -s 10.66.68.0/24 -o $EXT_IF -j MASQUERADE; iptables -t nat -D POSTROUTING -s 10.66.66.0/24 -o $EXT_IF -j MASQUERADE; iptables -D FORWARD -i $WG_IF -j ACCEPT; iptables -D FORWARD -o $WG_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 EOF
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    sysctl -p
-    echo "✓ WireGuard config created. Server public key:"
-    echo "  $SERVER_PUBLIC"
-fi
-systemctl enable --now wg-quick@wg0 || true
 
-echo "[5/6] Creating systemd services..."
-cat > /etc/systemd/system/red1rect-server.service <<EOF
+systemctl enable wg-quick@${WG_IF} >/dev/null 2>&1
+systemctl restart wg-quick@${WG_IF}
+
+echo "==> Сборка server-wrap"
+cd "$(dirname "$(readlink -f "$0")")/server-wrap"
+go build -o /opt/server-wrap .
+
+echo "==> systemd server-wrap.service"
+cat > /etc/systemd/system/server-wrap.service <<EOF
 [Unit]
-Description=Red1rect TURN Server (port $DTLS_PORT)
+Description=Red1rect VPN Server (WRAP protocol)
 After=network.target
 
 [Service]
-ExecStart=$INSTALL_DIR/server -listen 0.0.0.0:$DTLS_PORT -connect 127.0.0.1:$WG_PORT
+Type=simple
+ExecStart=/opt/server-wrap -listen 0.0.0.0:$LISTEN_PORT -wg $WG_IF -wg-public-ip $PUBLIC_IP -wg-port $WG_PORT -store /etc/red1rect-passwords.json -api 127.0.0.1:8765 -dns 1.1.1.1
 Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/red1rect-server-obfs.service <<EOF
-[Unit]
-Description=Red1rect TURN Server RTP-OBFS (port $OBFS_PORT)
-After=network.target
-
-[Service]
-ExecStart=$INSTALL_DIR/server -listen 0.0.0.0:$OBFS_PORT -connect 127.0.0.1:$WG_PORT -obfs
-Restart=always
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now red1rect-server red1rect-server-obfs
-
-echo "[6/6] Opening firewall ports..."
-ufw allow $DTLS_PORT/udp 2>/dev/null || iptables -A INPUT -p udp --dport $DTLS_PORT -j ACCEPT
-ufw allow $OBFS_PORT/udp 2>/dev/null || iptables -A INPUT -p udp --dport $OBFS_PORT -j ACCEPT
-ufw allow $WG_PORT/udp 2>/dev/null || iptables -A INPUT -p udp --dport $WG_PORT -j ACCEPT
+systemctl enable server-wrap >/dev/null 2>&1
+systemctl restart server-wrap
+sleep 1
+systemctl --no-pager status server-wrap | head -6 || true
 
 echo ""
-echo "✓ Done! Services running:"
-systemctl status red1rect-server red1rect-server-obfs --no-pager | grep -E "Active|Main PID"
-echo ""
-echo "Server IP: $(curl -s ifconfig.me)"
-echo "DTLS port (no-obfs): $DTLS_PORT"
-echo "DTLS port (obfs):    $OBFS_PORT"
-echo "WireGuard port:      $WG_PORT"
-echo ""
-echo "WireGuard server public key:"
-cat /etc/wireguard/server_public.key
+echo "================ ГОТОВО ================"
+echo "Добавить клиента (пароль):"
+echo "  curl -s -X POST -H 'Content-Type: application/json' -d '{\"password\":\"МОЙ_ПАРОЛЬ\"}' http://127.0.0.1:8765/api/password"
+echo "  → вернёт client_ip (напр. 10.66.66.2)"
+echo "Ключ для клиента:"
+echo "  red1rect://$PUBLIC_IP:$LISTEN_PORT:МОЙ_ПАРОЛЬ:VK_HASH:CLIENT_IP"
